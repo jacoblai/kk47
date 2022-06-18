@@ -16,6 +16,7 @@ import (
 	"reuserhttp/cors"
 	"reuserhttp/resultor"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -44,8 +45,14 @@ func main() {
 		addr = flag.String("l", ":7003", "绑定Host地址")
 	)
 	flag.Parse()
+	//dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	//if err != nil {
+	//	log.Println(err)
+	//	return
+	//}
 
 	queue := list.New()
+	lc := &sync.RWMutex{}
 
 	router := httprouter.New()
 	router.POST("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
@@ -57,17 +64,23 @@ func main() {
 			resultor.RetErr(w, err)
 			return
 		}
+		lc.Lock()
 		queue.PushBack(obj)
-		resultor.RetOk(w, obj, 1)
+		lc.Unlock()
+		resultor.RetOk(w, "ok", 1)
 	})
 	router.GET("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		lc.RLock()
 		item := queue.Front()
+		lc.RUnlock()
 		if item == nil {
 			resultor.RetErr(w, "wow")
 			return
 		}
+		lc.Lock()
 		queue.Remove(item)
-		resultor.RetOk(w, item, 1)
+		lc.Unlock()
+		resultor.RetOk(w, item.Value, 1)
 	})
 
 	srv := &http.Server{Handler: cors.CORS(router), ErrorLog: nil}
