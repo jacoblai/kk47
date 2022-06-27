@@ -53,9 +53,14 @@ func main() {
 
 	queue := list.New()
 	lc := &sync.RWMutex{}
+	wg := &sync.WaitGroup{}
 
 	router := httprouter.New()
 	router.POST("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		log.Println(r.Header.Get("custom"))
+		defer r.Body.Close()
+		wg.Add(1)
+		defer wg.Done()
 		var obj map[string]interface{}
 		dc := decoder.NewStreamDecoder(r.Body)
 		dc.UseInt64()
@@ -70,6 +75,7 @@ func main() {
 		resultor.RetOk(w, "ok", 1)
 	})
 	router.GET("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
+		defer r.Body.Close()
 		lc.RLock()
 		item := queue.Front()
 		lc.RUnlock()
@@ -109,6 +115,8 @@ func main() {
 				_ = srv.Shutdown(ctx)
 				cleanup <- true
 			}()
+			fmt.Println("waitting for slow ops....")
+			wg.Wait()
 			<-cleanup
 			fmt.Println("safe exit")
 			cleanupDone <- true
