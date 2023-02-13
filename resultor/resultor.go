@@ -16,13 +16,13 @@ var pool = &sync.Pool{
 }
 
 func RetChanges(w http.ResponseWriter) {
-	_, _ = w.Write([]byte(`{"code":0}`))
+	_, _ = w.Write([]byte(`{"code":0,"count":0}`))
 }
 
 func RetOk(w http.ResponseWriter, result interface{}, count int) {
 	resValue := reflect.ValueOf(result)
 	if resValue.IsZero() {
-		_, _ = w.Write([]byte(`{"code":0,"count":0}`))
+		RetChanges(w)
 		return
 	}
 	if resValue.Kind() == reflect.Ptr {

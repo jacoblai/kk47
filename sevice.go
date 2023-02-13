@@ -1,21 +1,24 @@
 package main
 
 import (
-	"container/list"
 	"context"
 	"flag"
 	"fmt"
+	"github.com/bytedance/sonic"
 	"github.com/bytedance/sonic/decoder"
 	"github.com/jacoblai/httprouter"
-	"github.com/libp2p/go-reuseport"
+	"golang.org/x/sys/unix"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"reuserhttp/cors"
+	"reuserhttp/deny"
+	primitive "reuserhttp/objectId"
 	"reuserhttp/resultor"
-	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -25,42 +28,25 @@ func init() {
 	rand.Seed(time.Now().UnixNano())
 	timeLocation, _ := time.LoadLocation("Asia/Shanghai") //使用时区码
 	time.Local = timeLocation
-}
-
-func setLimit() {
-	// Increase resources limitations
-	var rLimit syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-		log.Fatal(err)
-	}
-	rLimit.Cur = rLimit.Max
-	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
-		log.Fatal(err)
-	}
+	setLimit()
 }
 
 func main() {
-	setLimit()
 	var (
-		addr = flag.String("l", ":7003", "绑定Host地址")
+		addr = flag.String("l", ":7009", "绑定Host地址")
 	)
 	flag.Parse()
-	//dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
-	//if err != nil {
-	//	log.Println(err)
-	//	return
-	//}
+	dir, err := filepath.Abs(filepath.Dir(os.Args[0]))
+	if err != nil {
+		log.Println(err)
+		return
+	}
 
-	queue := list.New()
-	lc := &sync.RWMutex{}
-	wg := &sync.WaitGroup{}
+	queue := sync.Map{}
 
 	router := httprouter.New()
 	router.POST("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
-		log.Println(r.Header.Get("custom"))
 		defer r.Body.Close()
-		wg.Add(1)
-		defer wg.Done()
 		var obj map[string]interface{}
 		dc := decoder.NewStreamDecoder(r.Body)
 		dc.UseInt64()
@@ -69,40 +55,63 @@ func main() {
 			resultor.RetErr(w, err)
 			return
 		}
-		lc.Lock()
-		queue.PushBack(obj)
-		lc.Unlock()
-		resultor.RetOk(w, "ok", 1)
+		//防注入
+		bts, _ := sonic.Marshal(&obj)
+		if !deny.Injection(bts) {
+			resultor.RetErr(w, "1002")
+			return
+		}
+		id := primitive.NewObjectID().Hex()
+		queue.Store(id, obj)
+		resultor.RetOk(w, id, 1)
 	})
 	router.GET("/", func(w http.ResponseWriter, r *http.Request, ps httprouter.Params) {
 		defer r.Body.Close()
-		lc.RLock()
-		item := queue.Front()
-		lc.RUnlock()
-		if item == nil {
+		id, err := primitive.ObjectIDFromHex(r.URL.Query().Get("id"))
+		if err != nil {
+			resultor.RetErr(w, "id err")
+			return
+		}
+		item, ok := queue.LoadAndDelete(id.Hex())
+		if !ok {
 			resultor.RetErr(w, "wow")
 			return
 		}
-		lc.Lock()
-		queue.Remove(item)
-		lc.Unlock()
-		resultor.RetOk(w, item.Value, 1)
+		resultor.RetOk(w, item, 1)
 	})
 
 	srv := &http.Server{Handler: cors.CORS(router), ErrorLog: nil}
-	srv.Addr = *addr
-	go func() {
-		for i := 0; i < runtime.NumCPU(); i++ {
-			ln, err := reuseport.Listen("tcp", *addr)
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			var socketErr error
+			err := c.Control(func(fd uintptr) {
+				socketErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEPORT, 1)
+			})
 			if err != nil {
-				log.Fatal(err)
+				return err
 			}
+			return socketErr
+		},
+	}
+	ln, err := lc.Listen(context.Background(), "tcp", *addr)
+	if err != nil {
+		panic(err)
+	}
+	if *addr == ":443" {
+		go func() {
+			if err := srv.ServeTLS(ln, dir+"/data/api.lzyhr.com.pem", dir+"/data/api.lzyhr.com.key"); err != nil {
+				log.Println(err)
+			}
+		}()
+		log.Println("server on https port", *addr)
+	} else {
+		go func() {
 			if err := srv.Serve(ln); err != nil {
-				_ = ln.Close()
+				log.Println(err)
 			}
-		}
-	}()
-	fmt.Printf("Server with is running on prot [%s] \n", srv.Addr)
+		}()
+		log.Println("server on http port", *addr)
+	}
 
 	signalChan := make(chan os.Signal, 1)
 	cleanupDone := make(chan bool)
@@ -115,12 +124,22 @@ func main() {
 				_ = srv.Shutdown(ctx)
 				cleanup <- true
 			}()
-			fmt.Println("waitting for slow ops....")
-			wg.Wait()
 			<-cleanup
 			fmt.Println("safe exit")
 			cleanupDone <- true
 		}
 	}()
 	<-cleanupDone
+}
+
+func setLimit() {
+	// Increase resources limitations
+	var rLimit syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		log.Fatal(err)
+	}
+	rLimit.Cur = rLimit.Max
+	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
+		log.Fatal(err)
+	}
 }
